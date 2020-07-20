@@ -1,7 +1,6 @@
 package chunker
 
 import (
-	"errors"
 	"io"
 	"sync"
 )
@@ -11,7 +10,9 @@ const (
 	miB = 1024 * kiB
 
 	// WindowSize is the size of the sliding window.
-	windowSize = 64
+	//windowSize = 64
+	windowSize = 0
+
 
 	// MinSize is the default minimal size of a chunk.
 	MinSize = 512 * kiB
@@ -159,8 +160,6 @@ type chunkerConfig struct {
 
 //	pol               Pol
 //	polShift          uint
-	tables            tables
-	tablesInitialized bool
 	splitmask         uint64
     splitmask2        uint64
 
@@ -183,7 +182,15 @@ func (c *Chunker) SetAverageBits(averageBits int) {
 
 // New returns a new Chunker based on polynomial p that reads from rd.
 func New(rd io.Reader, pol Pol) *Chunker {
-	return NewWithBoundaries(rd, pol, MinSize, MaxSize)
+	//return NewWithBoundaries(rd, pol, MinSize, MaxSize)
+
+	var seed uint64 = 84372
+
+	for i:= 0; i < len(table); i++ {
+		table[i] = table[i] ^ seed
+	}
+
+	return NewWithBoundaries(rd, pol, 256*kiB, 4*miB)
 }
 
 // NewWithBoundaries returns a new Chunker based on polynomial p that reads from
@@ -227,8 +234,10 @@ func (c *Chunker) ResetWithBoundaries(rd io.Reader, pol Pol, min, max uint) {
 			MinSize:   min,
 			MaxSize:   max,
 			//splitmask: (1 << 20) - 1,
-            splitmask: MaskArray[19],
-            splitmask2: MaskArray[21],
+            //splitmask: MaskArray[19],
+			splitmask: 1048575,
+			splitmask2: 1048575,
+			//splitmask2: MaskArray[21],
 		},
 	}
 
@@ -317,9 +326,12 @@ func (c *Chunker) fillTables() {
 // subsequent calls yield an io.EOF error.
 func (c *Chunker) Next(data []byte) (Chunk, error) {
 	data = data[:0]
+
+	/**
 	if !c.tablesInitialized {
 		return Chunk{}, errors.New("tables for polynomial computation not initialized")
 	}
+	 */
 
 	//tabout := c.tables.out
 	//tabmod := c.tables.mod
@@ -336,6 +348,7 @@ func (c *Chunker) Next(data []byte) (Chunk, error) {
 	minSize := c.MinSize
 	maxSize := c.MaxSize
 	buf := c.buf
+
 	for {
 		if c.bpos >= c.bmax {
 			n, err := io.ReadFull(c.rd, buf[:])
@@ -406,14 +419,14 @@ func (c *Chunker) Next(data []byte) (Chunk, error) {
 		idx := minSize
 		var fp uint64 = 0
 		for ; idx < mid; idx++  {
-			fp = (fp << 1) + table[buf[c.bpos + idx]]
+			fp = (fp << 1) + table[buf[idx]]
 			add ++
-			if (fp & c.splitmask == 0) {
+			if fp & c.splitmask == 0 {
 				c.count = add
 				c.pos += uint(idx) + 1
 				c.bpos += uint(idx) + 1
 				c.buf = buf
-				data = append(data, c.buf[c.bpos:c.bpos+uint(idx)+1]...)
+				data = append(data, c.buf[c.bpos:uint(idx)+1]...)
 				chunk := Chunk {
 					Start: c.start,
 					Length: c.count,
@@ -426,14 +439,14 @@ func (c *Chunker) Next(data []byte) (Chunk, error) {
 		}
 
 		for ; idx < n; idx ++ {
-			fp = (fp << 1) + table[buf[c.bpos + idx]]
+			fp = (fp << 1) + table[buf[idx]]
 			add ++
-			if (fp & c.splitmask2 == 0) {
+			if fp & c.splitmask2 == 0 {
 				c.count = add
 				c.pos += uint(idx) + 1
 				c.bpos += uint(idx) + 1
 				c.buf = buf
-				data = append(data, c.buf[c.bpos:c.bpos + uint(idx)+1]...)
+				data = append(data, c.buf[c.bpos: uint(idx)+1]...)
 
 				chunk := Chunk {
 					Start: c.start,
