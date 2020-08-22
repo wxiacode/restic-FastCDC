@@ -2,24 +2,18 @@ package chunker
 
 import (
 	"io"
-	"sync"
+	"math/rand"
 )
 
 const (
 	kiB = 1024
 	miB = 1024 * kiB
-
-	// WindowSize is the size of the sliding window.
-	//windowSize = 64
-	windowSize = 0
-
-
 	// MinSize is the default minimal size of a chunk.
 	MinSize = 512 * kiB
 	// MaxSize is the default maximal size of a chunk.
 	MaxSize = 8 * miB
-
-	chunkerBufSize = 512 * kiB
+	//chunk Buffer Size is 2 * MinSize
+	chunkerBufSize = 2 * MinSize
 )
 
 var  MaskArray = [...]uint64{
@@ -45,8 +39,10 @@ var  MaskArray = [...]uint64{
 	0x0000d93777577000,		// 16MB
 }
 
-
-var table [256]uint64 = [256]uint64{
+// table is a pre-calculate random data array
+// it is used to generate chunk hash result
+// it will make xor operation with a seed to make a random array.
+var table = [256]uint64{
 	0xe80e8d55032474b3, 0x11b25b61f5924e15, 0x03aa5bd82a9eb669, 0xc45a153ef107a38c,
 	0xeac874b86f0f57b9, 0xa5ccedec95ec79c7, 0xe15a3320ad42ac0a, 0x5ed3583fa63cec15,
 	0xcd497bf624a4451d, 0xf9ade5b059683605, 0x773940c03fb11ca1, 0xa36b16e4a6ae15b2,
@@ -113,22 +109,6 @@ var table [256]uint64 = [256]uint64{
 	0x065ceb7a18381b58, 0xd2177671a31dc5ff, 0x90cd801f2f8701f9, 0x9d714428471c65fe,
 }
 
-
-type tables struct {
-	out [256]Pol
-	mod [256]Pol
-}
-
-// cache precomputed tables, these are read-only anyway
-var cache struct {
-	entries map[Pol]tables
-	sync.Mutex
-}
-
-func init() {
-	cache.entries = make(map[Pol]tables)
-}
-
 // Chunk is one content-dependent chunk of bytes whose end was cut when the
 // Rabin Fingerprint had the value stored in Cut.
 type Chunk struct {
@@ -139,9 +119,6 @@ type Chunk struct {
 }
 
 type chunkerState struct {
-	window [windowSize]byte
-	wpos   uint
-
 	buf  []byte
 	bpos uint
 	bmax uint
@@ -157,9 +134,6 @@ type chunkerState struct {
 
 type chunkerConfig struct {
 	MinSize, MaxSize uint
-
-//	pol               Pol
-//	polShift          uint
 	splitmask         uint64
     splitmask2        uint64
 
@@ -184,17 +158,17 @@ func (c *Chunker) SetAverageBits(averageBits int) {
 func New(rd io.Reader, pol Pol) *Chunker {
 	//return NewWithBoundaries(rd, pol, MinSize, MaxSize)
 
-	var seed uint64 = 84372
+	var seed = uint64(rand.Uint32()) << 32 + uint64(rand.Uint32())
 
 	for i:= 0; i < len(table); i++ {
 		table[i] = table[i] ^ seed
 	}
 
-	return NewWithBoundaries(rd, pol, 256*kiB, 4*miB)
+	return NewWithBoundaries(rd, pol, MinSize, MaxSize)
 }
 
-// NewWithBoundaries returns a new Chunker based on polynomial p that reads from
-// rd and custom min and max size boundaries.
+// NewWithBoundaries returns a new Chunker based on the two pre-defined split masks
+//and reads from rd and custom min and max size boundaries.
 func NewWithBoundaries(rd io.Reader, pol Pol, min, max uint) *Chunker {
 	c := &Chunker{
 		chunkerState: chunkerState{
@@ -205,7 +179,7 @@ func NewWithBoundaries(rd io.Reader, pol Pol, min, max uint) *Chunker {
 			rd:        rd,
 			MinSize:   min,
 			MaxSize:   max,
-			//splitmask: (1 << 20) - 1, // aim to create chunks of 20 bits or about 1MiB on average.
+			// average chunk size is 1 MiB, so set the splitMask is 512KiB and 2 MiB
             splitmask: MaskArray[19],
             splitmask2: MaskArray[21],
 		},
@@ -221,7 +195,7 @@ func (c *Chunker) Reset(rd io.Reader, pol Pol) {
 	c.ResetWithBoundaries(rd, pol, MinSize, MaxSize)
 }
 
-// ResetWithBoundaries reinitializes the chunker with a new reader, polynomial
+// ResetWithBoundaries reinitializes the chunker with a new reader,
 // and custom min and max size boundaries.
 func (c *Chunker) ResetWithBoundaries(rd io.Reader, pol Pol, min, max uint) {
 	*c = Chunker{
@@ -234,10 +208,8 @@ func (c *Chunker) ResetWithBoundaries(rd io.Reader, pol Pol, min, max uint) {
 			MinSize:   min,
 			MaxSize:   max,
 			//splitmask: (1 << 20) - 1,
-            //splitmask: MaskArray[19],
-			splitmask: 1048575,
-			splitmask2: 1048575,
-			//splitmask2: MaskArray[21],
+            splitmask: MaskArray[19],
+			splitmask2: MaskArray[21],
 		},
 	}
 
@@ -245,80 +217,13 @@ func (c *Chunker) ResetWithBoundaries(rd io.Reader, pol Pol, min, max uint) {
 }
 
 func (c *Chunker) reset() {
-	//c.polShift = uint(c.pol.Deg() - 8)
-	//c.fillTables()
-
-	for i := 0; i < windowSize; i++ {
-		c.window[i] = 0
-	}
-
 	c.closed = false
-	c.digest = 0
-	c.wpos = 0
 	c.count = 0
-	//c.digest = c.slide(c.digest, 1)
 	c.start = c.pos
 
 	// do not start a new chunk unless at least MinSize bytes have been read
-	c.pre = c.MinSize - windowSize
+	c.pre = c.MinSize
 }
-
-// fillTables calculates out_table and mod_table for optimization. This
-// implementation uses a cache in the global variable cache.
-/**
-func (c *Chunker) fillTables() {
-	// if polynomial hasn't been specified, do not compute anything for now
-	if c.pol == 0 {
-		return
-	}
-
-	c.tablesInitialized = true
-
-	// test if the tables are cached for this polynomial
-	cache.Lock()
-	defer cache.Unlock()
-	if t, ok := cache.entries[c.pol]; ok {
-		c.tables = t
-		return
-	}
-
-	// calculate table for sliding out bytes. The byte to slide out is used as
-	// the index for the table, the value contains the following:
-	// out_table[b] = Hash(b || 0 ||        ...        || 0)
-	//                          \ windowsize-1 zero bytes /
-	// To slide out byte b_0 for window size w with known hash
-	// H := H(b_0 || ... || b_w), it is sufficient to add out_table[b_0]:
-	//    H(b_0 || ... || b_w) + H(b_0 || 0 || ... || 0)
-	//  = H(b_0 + b_0 || b_1 + 0 || ... || b_w + 0)
-	//  = H(    0     || b_1 || ...     || b_w)
-	//
-	// Afterwards a new byte can be shifted in.
-	for b := 0; b < 256; b++ {
-		var h Pol
-
-		h = appendByte(h, byte(b), c.pol)
-		for i := 0; i < windowSize-1; i++ {
-			h = appendByte(h, 0, c.pol)
-		}
-		c.tables.out[b] = h
-	}
-
-	// calculate table for reduction mod Polynomial
-	k := c.pol.Deg()
-	for b := 0; b < 256; b++ {
-		// mod_table[b] = A | B, where A = (b(x) * x^k mod pol) and  B = b(x) * x^k
-		//
-		// The 8 bits above deg(Polynomial) determine what happens next and so
-		// these bits are used as a lookup to this table. The value is split in
-		// two parts: Part A contains the result of the modulus operation, part
-		// B is used to cancel out the 8 top bits so that one XOR operation is
-		// enough to reduce modulo Polynomial
-		c.tables.mod[b] = Pol(uint64(b)<<uint(k)).Mod(c.pol) | (Pol(b) << uint(k))
-	}
-
-	cache.entries[c.pol] = c.tables
-}
-*/
 
 // Next returns the position and length of the next chunk of data. If an error
 // occurs while reading, the error is returned. Afterwards, the state of the
@@ -327,23 +232,9 @@ func (c *Chunker) fillTables() {
 func (c *Chunker) Next(data []byte) (Chunk, error) {
 	data = data[:0]
 
-	/**
-	if !c.tablesInitialized {
-		return Chunk{}, errors.New("tables for polynomial computation not initialized")
-	}
-	 */
-
-	//tabout := c.tables.out
-	//tabmod := c.tables.mod
-	//polShift := c.polShift
 	// go guarantees the expected behavior for bit shifts even for shift counts
 	// larger than the value width. Bounding the value of polShift allows the compiler
 	// to optimize the code for 'digest >> polShift'
-    /**
-	if polShift > 53-8 {
-		return Chunk{}, errors.New("the polynomial must have a degree less than or equal 53")
-	}
-    */
 
 	minSize := c.MinSize
 	maxSize := c.MaxSize
@@ -416,17 +307,24 @@ func (c *Chunker) Next(data []byte) (Chunk, error) {
 			mid = n
 		}
 
-		idx := minSize
+		// calculate fp when loop idx from bpos to n
+		// when fp matches the pre-defined splitmask
+		// it generate a cut point
+		// when idx reaches n and still not matches mask, it stores the data.
+		// if idx reaches maxSize, it generate a cut point directly to limit the chunk size.
+
+		idx := c.bpos
 		var fp uint64 = 0
 		for ; idx < mid; idx++  {
 			fp = (fp << 1) + table[buf[idx]]
 			add ++
 			if fp & c.splitmask == 0 {
+				i := add - c.count - 1
+				data = append(data, c.buf[c.bpos:c.bpos + i + 1]...)
 				c.count = add
-				c.pos += uint(idx) + 1
-				c.bpos += uint(idx) + 1
+				c.pos += uint(i) + 1
+				c.bpos += uint(i) + 1
 				c.buf = buf
-				data = append(data, c.buf[c.bpos:uint(idx)+1]...)
 				chunk := Chunk {
 					Start: c.start,
 					Length: c.count,
@@ -442,11 +340,12 @@ func (c *Chunker) Next(data []byte) (Chunk, error) {
 			fp = (fp << 1) + table[buf[idx]]
 			add ++
 			if fp & c.splitmask2 == 0 {
+				i := add - c.count - 1
+				data = append(data, c.buf[c.bpos: c.bpos + i + 1]...)
 				c.count = add
-				c.pos += uint(idx) + 1
-				c.bpos += uint(idx) + 1
+				c.pos += uint(i) + 1
+				c.bpos += uint(i) + 1
 				c.buf = buf
-				data = append(data, c.buf[c.bpos: uint(idx)+1]...)
 
 				chunk := Chunk {
 					Start: c.start,
@@ -459,60 +358,24 @@ func (c *Chunker) Next(data []byte) (Chunk, error) {
 			}
 		}
 
+		if idx >= maxSize {
+			i := add - c.count - 1
+			data = append(data, c.buf[c.bpos: c.bpos+i+1]...)
+			c.count = add
+			c.pos += uint(i) + 1
+			c.bpos += uint(i) + 1
+			c.buf = buf
 
-
-		//digest := c.digest
-		//win := c.window
-		//wpos := c.wpos
-
-        /**
-		for _, b := range buf[c.bpos:c.bmax] {
-			// slide(b)
-			// limit wpos before to elide array bound checks
-			wpos = wpos % windowSize
-			out := win[wpos]
-			win[wpos] = b
-			digest ^= uint64(tabout[out])
-			wpos++
-
-			// updateDigest
-			index := byte(digest >> polShift)
-			digest <<= 8
-			digest |= uint64(b)
-
-			digest ^= uint64(tabmod[index])
-			// end manual inline
-
-			add++
-
-			if (digest&c.splitmask) == 0 || add >= maxSize {
-				if add < minSize {
-					continue
-				}
-
-				i := add - c.count - 1
-				data = append(data, c.buf[c.bpos:c.bpos+uint(i)+1]...)
-				c.count = add
-				c.pos += uint(i) + 1
-				c.bpos += uint(i) + 1
-				c.buf = buf
-
-				chunk := Chunk{
-					Start:  c.start,
-					Length: c.count,
-					Cut:    digest,
-					Data:   data,
-				}
-
-				c.reset()
-
-				return chunk, nil
+			chunk := Chunk {
+				Start: c.start,
+				Length: c.count,
+				Cut: fp,
+				Data: data,
 			}
+			c.reset()
+			return chunk, nil
 		}
-    */
-		//c.digest = digest
-		//c.window = win
-		//c.wpos = wpos % windowSize
+
 
 		steps := c.bmax - c.bpos
 		if steps > 0 {
@@ -522,31 +385,4 @@ func (c *Chunker) Next(data []byte) (Chunk, error) {
 		c.pos += steps
 		c.bpos = c.bmax
 	}
-}
-
-func updateDigest(digest uint64, polShift uint, tab *tables, b byte) (newDigest uint64) {
-	index := digest >> polShift
-	digest <<= 8
-	digest |= uint64(b)
-
-	digest ^= uint64(tab.mod[index])
-	return digest
-}
-/**
-func (c *Chunker) slide(digest uint64, b byte) (newDigest uint64) {
-	out := c.window[c.wpos]
-	c.window[c.wpos] = b
-	digest ^= uint64(c.tables.out[out])
-	c.wpos = (c.wpos + 1) % windowSize
-
-	digest = updateDigest(digest, c.polShift, &c.tables, b)
-	return digest
-}
-*/
-
-func appendByte(hash Pol, b byte, pol Pol) Pol {
-	hash <<= 8
-	hash |= Pol(b)
-
-	return hash.Mod(pol)
 }
